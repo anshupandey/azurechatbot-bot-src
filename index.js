@@ -1,96 +1,79 @@
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License.
+var restify = require('restify');
+var builder = require('botbuilder');
+var botbuilder_azure = require("botbuilder-azure");
+var builder_cognitiveservices = require("botbuilder-cognitiveservices");
 
-// index.js is used to setup and configure your bot
+// Setup Restify Server
+var server = restify.createServer();
+server.listen(process.env.port || process.env.PORT || 3978, function () {
+    console.log('%s listening to %s', server.name, server.url);
+});
 
-// Import required packages
-const path = require('path');
-const restify = require('restify');
-
-// Import required bot services. See https://aka.ms/bot-services to learn more about the different parts of a bot.
-const { BotFrameworkAdapter, ConversationState, MemoryStorage, UserState } = require('botbuilder');
-const { QnAMaker } = require('botbuilder-ai');
-
-const { QnABot } = require('./bots/qnaBot');
-const { RootDialog } = require('./dialogs/rootDialog');
-
-// Note: Ensure you have a .env file and include QnAMakerKnowledgeBaseId, QnAMakerEndpointKey and QnAMakerHost.
-const ENV_FILE = path.join(__dirname, '.env');
-require('dotenv').config({ path: ENV_FILE });
-
-// Create adapter.
-// See https://aka.ms/about-bot-adapter to learn more about adapters.
-const adapter = new BotFrameworkAdapter({
+// Create chat connector for communicating with the Bot Framework Service
+var connector = new builder.ChatConnector({
     appId: process.env.MicrosoftAppId,
     appPassword: process.env.MicrosoftAppPassword,
     openIdMetadata: process.env.BotOpenIdMetadata
 });
 
-// Catch-all for errors.
-adapter.onTurnError = async (context, error) => {
-    // This check writes out errors to console log .vs. app insights.
-    // NOTE: In production environment, you should consider logging this to Azure
-    //       application insights.
-    console.error(`\n [onTurnError] unhandled error: ${ error }`);
+// Listen for messages from users
+server.post('/api/messages', connector.listen());
 
-    // Send a trace activity, which will be displayed in Bot Framework Emulator
-    await context.sendTraceActivity(
-        'OnTurnError Trace',
-        `${ error }`,
-        'https://www.botframework.com/schemas/error',
-        'TurnError'
-    );
+var tableName = 'botdata';
+var azureTableClient = new botbuilder_azure.AzureTableClient(tableName, process.env['AzureWebJobsStorage']);
+var tableStorage = new botbuilder_azure.AzureBotStorage({ gzipData: false }, azureTableClient);
 
-    // Send a message to the user
-    let onTurnErrorMessage = 'The bot encounted an error or bug.';
-    await context.sendActivity(onTurnErrorMessage, onTurnErrorMessage, InputHints.ExpectingInput);
-    onTurnErrorMessage = 'To continue to run this bot, please fix the bot source code.';
-    await context.sendActivity(onTurnErrorMessage, onTurnErrorMessage, InputHints.ExpectingInput);
-    // Clear out state
-    await conversationState.delete(context);
-};
+// Create your bot with a function to receive messages from the user
+var bot = new builder.UniversalBot(connector);
+bot.set('storage', tableStorage);
 
-// Define the state store for your bot. See https://aka.ms/about-bot-state to learn more about using MemoryStorage.
-// A bot requires a state storage system to persist the dialog and user state between messages.
-const memoryStorage = new MemoryStorage();
-
-// Create conversation and user state with in-memory storage provider.
-const conversationState = new ConversationState(memoryStorage);
-const userState = new UserState(memoryStorage);
-
-var endpointHostName = process.env.QnAEndpointHostName;
-if (!endpointHostName.startsWith('https://')) {
-    endpointHostName = 'https://' + endpointHostName;
-}
-
-if (!endpointHostName.endsWith('/qnamaker')) {
-    endpointHostName = endpointHostName + '/qnamaker';
-}
-
-const qnaService = new QnAMaker({
+// Recognizer and and Dialog for preview QnAMaker service
+var previewRecognizer = new builder_cognitiveservices.QnAMakerRecognizer({
     knowledgeBaseId: process.env.QnAKnowledgebaseId,
-    endpointKey: process.env.QnAAuthKey,
-    host: endpointHostName
+    authKey: process.env.QnAAuthKey || process.env.QnASubscriptionKey
 });
 
-// Create the main dialog.
-const dialog = new RootDialog(qnaService);
+var basicQnAMakerPreviewDialog = new builder_cognitiveservices.QnAMakerDialog({
+    recognizers: [previewRecognizer],
+    defaultMessage: 'No match! Try changing the query terms!',
+    qnaThreshold: 0.3
+}
+);
 
-// Create the bot's main handler.
-const bot = new QnABot(conversationState, userState, dialog);
+bot.dialog('basicQnAMakerPreviewDialog', basicQnAMakerPreviewDialog);
 
-// Create HTTP server
-const server = restify.createServer();
-server.listen(process.env.port || process.env.PORT || 3978, function() {
-    console.log(`\n${ server.name } listening to ${ server.url }`);
-    console.log('\nGet Bot Framework Emulator: https://aka.ms/botframework-emulator');
-    console.log('\nTo talk to your bot, open the emulator select "Open Bot"');
+// Recognizer and and Dialog for GA QnAMaker service
+var recognizer = new builder_cognitiveservices.QnAMakerRecognizer({
+    knowledgeBaseId: process.env.QnAKnowledgebaseId,
+    authKey: process.env.QnAAuthKey || process.env.QnASubscriptionKey, // Backward compatibility with QnAMaker (Preview)
+    endpointHostName: process.env.QnAEndpointHostName
 });
 
-// Listen for incoming requests.
-server.post('/api/messages', (req, res) => {
-    adapter.processActivity(req, res, async (turnContext) => {
-        // Route the message to the bot's main handler.
-        await bot.run(turnContext);
-    });
+var basicQnAMakerDialog = new builder_cognitiveservices.QnAMakerDialog({
+    recognizers: [recognizer],
+    defaultMessage: "I'm not quite sure what you're asking. Please ask your question again.",
+    qnaThreshold: 0.3
 });
+
+bot.dialog('basicQnAMakerDialog', basicQnAMakerDialog);
+
+bot.dialog('/', //basicQnAMakerDialog);
+    [
+        function (session) {
+            var qnaKnowledgebaseId = process.env.QnAKnowledgebaseId;
+            var qnaAuthKey = process.env.QnAAuthKey || process.env.QnASubscriptionKey;
+            var endpointHostName = process.env.QnAEndpointHostName;
+
+            // QnA Subscription Key and KnowledgeBase Id null verification
+            if ((qnaAuthKey == null || qnaAuthKey == '') || (qnaKnowledgebaseId == null || qnaKnowledgebaseId == ''))
+                session.send('Please set QnAKnowledgebaseId, QnAAuthKey and QnAEndpointHostName (if applicable) in App Settings. Learn how to get them at https://aka.ms/qnaabssetup.');
+            else {
+                if (endpointHostName == null || endpointHostName == '')
+                    // Replace with Preview QnAMakerDialog service
+                    session.replaceDialog('basicQnAMakerPreviewDialog');
+                else
+                    // Replace with GA QnAMakerDialog service
+                    session.replaceDialog('basicQnAMakerDialog');
+            }
+        }
+    ]);
